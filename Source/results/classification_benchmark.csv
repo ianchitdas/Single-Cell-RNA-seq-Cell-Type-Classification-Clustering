@@ -1,0 +1,4 @@
+Classifier,Test_Accuracy,Macro_F1,Weighted_F1,Runtime_Sec,Peak_VRAM_MB
+CellTypist (Zero-Shot),0.7875,0.6396,0.7819,1.63,0.0
+scANVI (Semi-Supervised),0.9694,0.9373,0.9688,96.33,61.22
+PyTorch MLP on X_scVI,0.9762,0.9532,0.976,5.39,33.66
