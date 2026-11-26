@@ -12,7 +12,7 @@ Generates:
   2. Visualizations (`figures/`):
      - `umap_batch_integration.png`: 2x3 UMAP grid comparing PCA vs. scVI (Batch, Labels, Leiden).
      - `umap_classifier_predictions.png`: 2x2 UMAP grid comparing Ground Truth vs. all 3 classifiers.
-     - `marker_genes_dotplot.png`: Canonical PBMC lineage marker expression across scVI clusters.
+     - `marker_genes_dotplot.png`: Canonical PBMC lineage marker expression across cell types.
      - `confusion_matrices.png`: Row-normalized confusion matrices for all 3 classifiers.
      - `benchmark_summary.png`: Grouped bar charts of clustering & classification metrics.
 """
@@ -85,27 +85,87 @@ def _get_symbol_indexed_raw(adata: sc.AnnData, data_dir: Path) -> sc.AnnData:
     raw_adata = adata.raw.to_adata() if adata.raw is not None else adata.copy()
     target_genes = {g for genes in CANONICAL_PBMC_MARKERS.values() for g in genes}
 
-    if len(set(raw_adata.var_names.astype(str)) & target_genes) >= 5:
+    # 1. Direct match on var_names
+    best_symbols: np.ndarray | None = None
+    best_overlap = len(set(raw_adata.var_names.astype(str)) & target_genes)
+    best_source = "adata.raw.var_names"
+    if best_overlap >= 5:
         raw_adata.var_names_make_unique()
         return raw_adata
 
+    # 2. Direct match on any column in raw_adata.var
     for col in raw_adata.var.columns:
         candidates = raw_adata.var[col].astype(str).str.strip().to_numpy()
-        if len(set(candidates) & target_genes) >= 5:
-            raw_adata.var_names = pd.Index(candidates)
-            raw_adata.var_names_make_unique()
-            return raw_adata
+        overlap = len(set(candidates) & target_genes)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_symbols = candidates
+            best_source = f"adata.raw.var['{col}']"
 
+    # 3. Map via gene_info_pbmc.csv (integer index OR Ensembl ID -> symbol)
     gene_info_path = data_dir / "gene_info_pbmc.csv"
-    if gene_info_path.exists() and raw_adata.var_names.astype(str).str.isdigit().all():
+    if best_overlap < 5 and gene_info_path.exists():
         gene_info = pd.read_csv(gene_info_path)
-        idx = raw_adata.var_names.astype(int).to_numpy()
         for col in gene_info.columns:
             col_vals = gene_info[col].astype(str).str.strip()
-            if len(set(col_vals) & target_genes) >= 5 and idx.max() < len(gene_info):
-                raw_adata.var_names = pd.Index(col_vals.iloc[idx].to_numpy())
-                raw_adata.var_names_make_unique()
-                return raw_adata
+            if len(set(col_vals) & target_genes) < 5:
+                continue
+
+            if raw_adata.var_names.astype(str).str.isdigit().all():
+                idx = raw_adata.var_names.astype(int).to_numpy()
+                if idx.max() < len(gene_info):
+                    candidates = col_vals.iloc[idx].to_numpy()
+                    overlap = len(set(candidates) & target_genes)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_symbols = candidates
+                        best_source = f"{gene_info_path.name}['{col}'] (by index)"
+
+            for id_col in gene_info.columns:
+                if id_col == col:
+                    continue
+                id_map = dict(zip(gene_info[id_col].astype(str).str.strip(), col_vals))
+                series_to_check = [pd.Series(raw_adata.var_names.astype(str))] + [
+                    raw_adata.var[vcol].astype(str) for vcol in raw_adata.var.columns
+                ]
+                for ser in series_to_check:
+                    mapped = ser.map(id_map).fillna(ser).to_numpy()
+                    overlap = len(set(mapped) & target_genes)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_symbols = mapped
+                        best_source = f"{gene_info_path.name}['{col}'] (via '{id_col}')"
+
+    # 4. Fallback: read 10x genes.tsv / features.tsv(.gz) from extracted pbmc8k/pbmc4k
+    if best_overlap < 5:
+        for pattern in ("genes.tsv*", "features.tsv*"):
+            for tsv_path in data_dir.rglob(pattern):
+                tsv_df = pd.read_csv(tsv_path, sep="\t", header=None)
+                if tsv_df.shape[1] >= 2:
+                    ensg_to_sym = dict(
+                        zip(
+                            tsv_df.iloc[:, 0].astype(str).str.strip(),
+                            tsv_df.iloc[:, 1].astype(str).str.strip(),
+                        )
+                    )
+                    series_to_check = [pd.Series(raw_adata.var_names.astype(str))] + [
+                        raw_adata.var[vcol].astype(str) for vcol in raw_adata.var.columns
+                    ]
+                    for ser in series_to_check:
+                        mapped = ser.map(ensg_to_sym).fillna(ser).to_numpy()
+                        overlap = len(set(mapped) & target_genes)
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_symbols = mapped
+                            best_source = f"{tsv_path.name} (Ensembl -> Symbol)"
+
+    if best_symbols is not None and best_overlap >= 5:
+        raw_adata.var_names = pd.Index(best_symbols)
+        logger.info(
+            "Mapped %d canonical PBMC markers via %s.",
+            best_overlap,
+            best_source,
+        )
 
     raw_adata.var_names_make_unique()
     return raw_adata
@@ -275,7 +335,8 @@ def plot_marker_genes_dotplot(adata: sc.AnnData, data_dir: Path, output_file: Pa
         show=False,
         return_fig=True,
     )
-    dp.savefig(str(output_file), dpi=150, bbox_inches="tight")
+    dp.make_figure()
+    dp.fig.savefig(str(output_file), dpi=150, bbox_inches="tight")
     plt.close("all")
     logger.info("Saved canonical PBMC marker dotplot to %s", output_file)
 
